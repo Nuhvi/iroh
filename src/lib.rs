@@ -7,6 +7,7 @@ pub mod progress;
 pub mod protocol;
 pub mod provider;
 pub mod rpc_protocol;
+pub mod rpc_util;
 
 mod tls;
 mod util;
