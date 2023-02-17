@@ -15,6 +15,7 @@ use sendme::provider::Ticket;
 use sendme::rpc_protocol::{
     ListRequest, ProvideRequest, SendmeRequest, SendmeResponse, SendmeService, VersionRequest,
 };
+use sendme::rpc_util::RpcClientExt;
 use sendme::{protocol::AuthToken, provider::Database};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -341,7 +342,11 @@ async fn main() -> Result<()> {
         }
         Commands::Add { path } => {
             let client = make_rpc_client().await?;
-            let response = client.rpc(ProvideRequest { path: path.clone() }).await??;
+            let response = client.rpc_with_progress(ProvideRequest { path: path.clone() }, |x| {
+                async move {
+                    println!("progress {x}");
+                }
+            }).await??;
             println!(
                 "path {} added. Hash {}",
                 path.display(),

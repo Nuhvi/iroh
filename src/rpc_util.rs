@@ -10,8 +10,9 @@ use quic_rpc::{
     RpcClient, Service, ServiceConnection, ServiceEndpoint,
 };
 
+/// Interaction pattern for rpc messages that can report progress
 #[derive(Debug, Clone, Copy)]
-struct RpcWithProgress;
+pub struct RpcWithProgress;
 
 impl InteractionPattern for RpcWithProgress {}
 
@@ -63,8 +64,8 @@ pub trait RpcClientExt<S: Service, C: ServiceConnection<S>> {
     /// is not fast enough to process them.
     fn rpc_with_progress<M, F, Fut>(
         &self,
-        progress: F,
         msg: M,
+        progress: F,
     ) -> BoxFuture<'_, std::result::Result<M::Response, RpcClientError<C>>>
     where
         M: RpcWithProgressMsg<S>,
@@ -75,15 +76,15 @@ pub trait RpcClientExt<S: Service, C: ServiceConnection<S>> {
 impl<S: Service, C: ServiceConnection<S>> RpcClientExt<S, C> for RpcClient<S, C> {
     fn rpc_with_progress<M, F, Fut>(
         &self,
-        progress: F,
         msg: M,
+        progress: F,
     ) -> BoxFuture<'_, std::result::Result<M::Response, RpcClientError<C>>>
     where
         M: RpcWithProgressMsg<S>,
         F: (Fn(M::Progress) -> Fut) + Send + 'static,
         Fut: Future<Output = ()> + Send,
     {
-        let (psend, mut precv) = tokio::sync::mpsc::channel(1);
+        let (psend, mut precv) = tokio::sync::mpsc::channel(5);
         // future that does the call and filters the results
         let worker = async move {
             let (mut send, mut recv) = self
@@ -153,7 +154,7 @@ pub trait RpcChannelExt<S: Service, C: ServiceEndpoint<S>> {
     ) -> BoxFuture<'static, std::result::Result<(), RpcServerError<C>>>
     where
         M: RpcWithProgressMsg<S>,
-        F: FnOnce(T, Box<dyn Fn(M::Progress) + Send>, M) -> Fut + Send + 'static,
+        F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
         Fut: Future<Output = M::Response> + Send,
         T: Send + 'static;
 }
@@ -167,28 +168,30 @@ impl<S: Service, C: ServiceEndpoint<S>> RpcChannelExt<S, C> for RpcChannel<S, C>
     ) -> BoxFuture<'static, std::result::Result<(), RpcServerError<C>>>
     where
         M: RpcWithProgressMsg<S>,
-        F: FnOnce(T, Box<dyn Fn(M::Progress) + Send>, M) -> Fut + Send + 'static,
+        F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
         Fut: Future<Output = M::Response> + Send,
         T: Send + 'static,
     {
-        let (send, mut recv) = tokio::sync::mpsc::channel(1);
+        let (send, mut recv) = tokio::sync::mpsc::channel(5);
         let send2 = send.clone();
 
         // call the function that will actually perform the rpc, then send the result
         // to the forwarder, which will forward it to the rpc channel.
         let fut = async move {
-            let send: Box<dyn Fn(M::Progress) + Send> = Box::new(move |progress| {
+            let progress: Box<dyn Fn(M::Progress) + Send> = Box::new(move |progress| {
                 if send.try_send(Err(progress)).is_err() {
                     // The forwarder is not ready to receive the message.
                     // Drop it, it is just a self contained progress message.
                     tracing::debug!("progress message dropped");
                 }
             });
-            let res = f(target, send, msg).await;
+            let res = f(target, msg, progress).await;
             send2
                 .send(Ok(res))
                 .await
-                .map_err(|_| RpcServerError::EarlyClose)
+                .map_err(|_| RpcServerError::EarlyClose)?;
+            // wait forever. we want the other future to complete first.
+            future::pending::<std::result::Result<(), RpcServerError<C>>>().await
         };
         // forwarder future that will forward messages to the rpc channel.
         let forwarder = async move {
@@ -205,10 +208,10 @@ impl<S: Service, C: ServiceEndpoint<S>> RpcChannelExt<S, C> for RpcChannel<S, C>
                     .await
                     .map_err(RpcServerError::SendError)?;
                 if done {
-                    return Ok(());
+                    break;
                 }
             }
-            future::pending::<std::result::Result<(), RpcServerError<C>>>().await
+            Ok(())
         };
         // wait until either the rpc future or the forwarder future completes.
         //

@@ -44,8 +44,9 @@ use crate::rpc_protocol::{
     ListRequest, ListResponse, ProvideRequest, ProvideResponse, SendmeRequest, SendmeService,
     VersionRequest, VersionResponse, WatchRequest, WatchResponse,
 };
+use crate::rpc_util::RpcChannelExt;
 use crate::tls::{self, Keypair, PeerId};
-use crate::util::{self, Hash};
+use crate::util::{self, Hash, RpcResult, RpcError};
 
 const MAX_CONNECTIONS: u32 = 1024;
 const MAX_STREAMS: u64 = 10;
@@ -368,8 +369,9 @@ impl Handler {
             .map(|(hash, path, size)| ListResponse { hash, path, size });
         futures::stream::iter(items)
     }
-    async fn provide(self, msg: ProvideRequest) -> anyhow::Result<ProvideResponse> {
+    async fn provide_impl(self, msg: ProvideRequest, progress: impl Fn(f64)) -> anyhow::Result<ProvideResponse> {
         let path = msg.path;
+        progress(0.0);
         let data_sources = if path.is_dir() {
             let mut paths = Vec::new();
             let mut iter = tokio::fs::read_dir(&path).await?;
@@ -384,11 +386,15 @@ impl Handler {
         } else {
             anyhow::bail!("path must be either a Directory or a File");
         };
+        progress(0.5);
         // create the collection
         // todo: provide feedback for progress
         let (db, hash) = create_collection_inner(data_sources).await?;
         self.0.union_with(db);
         Ok(ProvideResponse { hash })
+    }
+    async fn provide(self, msg: ProvideRequest, progress: impl Fn(f64)) -> RpcResult<ProvideResponse> {
+        self.provide_impl(msg, progress).await.map_err(RpcError::from)
     }
     async fn version(self, _: VersionRequest) -> VersionResponse {
         VersionResponse {
@@ -425,7 +431,7 @@ fn handle_rpc_request<C: ServiceEndpoint<SendmeService>>(
         use SendmeRequest::*;
         match msg {
             List(msg) => chan.server_streaming(msg, handler, Handler::list).await,
-            Provide(msg) => chan.rpc_map_err(msg, handler, Handler::provide).await,
+            Provide(msg) => chan.rpc_with_progress(msg, handler, Handler::provide).await,
             Watch(msg) => chan.server_streaming(msg, handler, Handler::watch).await,
             Version(msg) => chan.rpc(msg, handler, Handler::version).await,
         }

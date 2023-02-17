@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 
 use crate::{util::RpcResult, Hash};
+use crate::rpc_util::*;
 use derive_more::{From, TryInto};
 use quic_rpc::{
     message::{Msg, RpcMsg, ServerStreaming, ServerStreamingMsg},
@@ -19,7 +20,12 @@ pub struct ProvideResponse {
     pub hash: Hash,
 }
 
-impl RpcMsg<SendmeService> for ProvideRequest {
+impl Msg<SendmeService> for ProvideRequest {
+    type Pattern = RpcWithProgress;
+}
+
+impl RpcWithProgressMsg<SendmeService> for ProvideRequest {
+    type Progress = f64;
     type Response = RpcResult<ProvideResponse>;
 }
 
@@ -84,11 +90,13 @@ pub enum SendmeRequest {
 
 /// Response enum
 #[derive(Debug, Serialize, Deserialize, From, TryInto)]
+#[try_into(owned, ref)]
 pub enum SendmeResponse {
     Watch(WatchResponse),
     Version(VersionResponse),
     List(ListResponse),
     Provide(RpcResult<ProvideResponse>),
+    ProvideProgress(f64),
 }
 
 impl Service for SendmeService {
