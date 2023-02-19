@@ -342,11 +342,11 @@ async fn main() -> Result<()> {
         }
         Commands::Add { path } => {
             let client = make_rpc_client().await?;
-            let response = client.rpc_with_progress(ProvideRequest { path: path.clone() }, |x| {
-                async move {
+            let response = client
+                .rpc_with_progress(ProvideRequest { path: path.clone() }, |x| async move {
                     println!("progress {x}");
-                }
-            }).await??;
+                })
+                .await??;
             println!(
                 "path {} added. Hash {}",
                 path.display(),

@@ -10,6 +10,7 @@
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::io::{BufReader, Read};
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -23,7 +24,8 @@ use abao::encode::SliceExtractor;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures::future;
-use futures::Stream;
+use futures::{FutureExt, Stream};
+use pin_project::pin_project;
 use quic_rpc::server::{RpcChannel, RpcServerError};
 use quic_rpc::transport::misc::DummyServerEndpoint;
 use quic_rpc::{RpcServer, ServiceEndpoint};
@@ -46,7 +48,7 @@ use crate::rpc_protocol::{
 };
 use crate::rpc_util::RpcChannelExt;
 use crate::tls::{self, Keypair, PeerId};
-use crate::util::{self, Hash, RpcResult, RpcError};
+use crate::util::{self, Hash, RpcError, RpcResult};
 
 const MAX_CONNECTIONS: u32 = 1024;
 const MAX_STREAMS: u64 = 10;
@@ -358,6 +360,74 @@ impl Future for Provider {
     }
 }
 
+trait Invoke<A, R> {
+    fn invoke(self, a: A) -> R;
+}
+impl<R, T: Fn() -> R> Invoke<(), R> for T {
+    fn invoke(self, _: ()) -> R {
+        (self)()
+    }
+}
+impl<A, R, T: Fn(A) -> R> Invoke<(A,), R> for T {
+    fn invoke(self, a: (A,)) -> R {
+        (self)(a.0)
+    }
+}
+impl<A, B, R, T: Fn(A, B) -> R> Invoke<(A, B), R> for T {
+    fn invoke(self, a: (A, B)) -> R {
+        (self)(a.0, a.1)
+    }
+}
+impl<A, B, C, R, T: Fn(A, B, C) -> R> Invoke<(A, B, C), R> for T {
+    fn invoke(self, a: (A, B, C)) -> R {
+        (self)(a.0, a.1, a.2)
+    }
+}
+impl<A, B, C, D, R, T: Fn(A, B, C, D) -> R> Invoke<(A, B, C, D), R> for T {
+    fn invoke(self, a: (A, B, C, D)) -> R {
+        (self)(a.0, a.1, a.2, a.3)
+    }
+}
+
+#[pin_project]
+struct ErrToRpcError<F, R, E>(#[pin] F, PhantomData<(R, E)>);
+
+impl<F, R, E> Future for ErrToRpcError<F, R, E>
+where
+    F: Future<Output = Result<R, E>>,
+    RpcError: From<E>,
+{
+    type Output = RpcResult<R>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        match this.0.poll_unpin(cx) {
+            Poll::Ready(Ok(r)) => Poll::Ready(Ok(r)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(RpcError::from(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn transform_result<A, Fut, R, E, T>(value: T) -> impl FnOnce(A) -> ErrToRpcError<Fut, R, E>
+where
+    T: Invoke<A, Fut> + Send + 'static,
+    Fut: Future<Output = Result<R, E>> + Send + 'static,
+    RpcError: From<E>,
+    A: Send + 'static,
+{
+    move |a: A| -> ErrToRpcError<Fut, R, E> { ErrToRpcError(value.invoke(a), PhantomData) }
+}
+
+fn test() {
+    let a = || async move { anyhow::Ok(()) };
+    let b = |x: u64| async move { anyhow::Ok(x) };
+    let c = |x: u64, y: u64| async move { anyhow::Ok((x, y)) };
+    let a = transform_result(a);
+    let b = transform_result(b);
+    let c = transform_result(c);
+}
+
 struct Handler(Database);
 
 impl Handler {
@@ -369,7 +439,11 @@ impl Handler {
             .map(|(hash, path, size)| ListResponse { hash, path, size });
         futures::stream::iter(items)
     }
-    async fn provide_impl(self, msg: ProvideRequest, progress: impl Fn(f64)) -> anyhow::Result<ProvideResponse> {
+    async fn provide_impl(
+        self,
+        msg: ProvideRequest,
+        progress: impl Fn(f64),
+    ) -> anyhow::Result<ProvideResponse> {
         let path = msg.path;
         progress(0.0);
         let data_sources = if path.is_dir() {
@@ -393,8 +467,14 @@ impl Handler {
         self.0.union_with(db);
         Ok(ProvideResponse { hash })
     }
-    async fn provide(self, msg: ProvideRequest, progress: impl Fn(f64)) -> RpcResult<ProvideResponse> {
-        self.provide_impl(msg, progress).await.map_err(RpcError::from)
+    async fn provide(
+        self,
+        msg: ProvideRequest,
+        progress: impl Fn(f64),
+    ) -> RpcResult<ProvideResponse> {
+        self.provide_impl(msg, progress)
+            .await
+            .map_err(RpcError::from)
     }
     async fn version(self, _: VersionRequest) -> VersionResponse {
         VersionResponse {
