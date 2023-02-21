@@ -1,7 +1,9 @@
 //! Utility for rpc interactions
+use std::marker::PhantomData;
+
 use futures::{
-    future::{self, BoxFuture},
-    Future, FutureExt, SinkExt, StreamExt,
+    future::{self, BoxFuture, ErrInto},
+    Future, FutureExt, SinkExt, StreamExt, TryFuture, TryFutureExt,
 };
 use quic_rpc::{
     client::RpcClientError,
@@ -9,6 +11,8 @@ use quic_rpc::{
     server::{RpcChannel, RpcServerError},
     RpcClient, Service, ServiceConnection, ServiceEndpoint,
 };
+
+use crate::util::RpcError;
 
 /// Interaction pattern for rpc messages that can report progress
 #[derive(Debug, Clone, Copy)]
@@ -154,7 +158,8 @@ pub trait RpcChannelExt<S: Service, C: ServiceEndpoint<S>> {
     ) -> BoxFuture<'static, std::result::Result<(), RpcServerError<C>>>
     where
         M: RpcWithProgressMsg<S>,
-        F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
+        F: FnOnceTrait<(T, M, Box<dyn Fn(M::Progress) + Send>), Fut> + Send + 'static,
+        // F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
         Fut: Future<Output = M::Response> + Send,
         T: Send + 'static;
 }
@@ -168,7 +173,8 @@ impl<S: Service, C: ServiceEndpoint<S>> RpcChannelExt<S, C> for RpcChannel<S, C>
     ) -> BoxFuture<'static, std::result::Result<(), RpcServerError<C>>>
     where
         M: RpcWithProgressMsg<S>,
-        F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
+        F: FnOnceTrait<(T, M, Box<dyn Fn(M::Progress) + Send>), Fut> + Send + 'static,
+        // F: FnOnce(T, M, Box<dyn Fn(M::Progress) + Send>) -> Fut + Send + 'static,
         Fut: Future<Output = M::Response> + Send,
         T: Send + 'static,
     {
@@ -185,7 +191,7 @@ impl<S: Service, C: ServiceEndpoint<S>> RpcChannelExt<S, C> for RpcChannel<S, C>
                     tracing::debug!("progress message dropped");
                 }
             });
-            let res = f(target, msg, progress).await;
+            let res = f.call((target, msg, progress)).await;
             send2
                 .send(Ok(res))
                 .await
@@ -224,5 +230,85 @@ impl<S: Service, C: ServiceEndpoint<S>> RpcChannelExt<S, C> for RpcChannel<S, C>
             }
         }
         .boxed()
+    }
+}
+
+/// Trait to abstract over functions with different arity.
+///
+/// Until https://github.com/rust-lang/rust/issues/29625 is implemented
+pub trait FnOnceTrait<A, R> {
+    /// Call the function with the given arguments.
+    fn call(self, a: A) -> R;
+}
+impl<R, T: FnOnce() -> R> FnOnceTrait<(), R> for T {
+    fn call(self, _: ()) -> R {
+        (self)()
+    }
+}
+impl<A, R, T: FnOnce(A) -> R> FnOnceTrait<(A,), R> for T {
+    fn call(self, a: (A,)) -> R {
+        (self)(a.0)
+    }
+}
+impl<A, B, R, T: FnOnce(A, B) -> R> FnOnceTrait<(A, B), R> for T {
+    fn call(self, a: (A, B)) -> R {
+        (self)(a.0, a.1)
+    }
+}
+impl<A, B, C, R, T: FnOnce(A, B, C) -> R> FnOnceTrait<(A, B, C), R> for T {
+    fn call(self, a: (A, B, C)) -> R {
+        (self)(a.0, a.1, a.2)
+    }
+}
+impl<A, B, C, D, R, T: FnOnce(A, B, C, D) -> R> FnOnceTrait<(A, B, C, D), R> for T {
+    fn call(self, a: (A, B, C, D)) -> R {
+        (self)(a.0, a.1, a.2, a.3)
+    }
+}
+
+/// Take a function that produces a [TryFuture] and transform the result
+/// so that the error is wrapped in an [RpcError] so that it is serializable.
+pub const fn err_into_rpc_error<A, Fut, T>(value: T) -> impl FnOnceTrait<A, ErrInto<Fut, RpcError>>
+where
+    T: FnOnceTrait<A, Fut> + Send,
+    Fut: TryFuture + Send,
+    RpcError: From<Fut::Error>,
+    A: Send,
+{
+    FnOnceErrInto {
+        inner: value,
+        p: PhantomData,
+    }
+}
+
+struct FnOnceErrInto<Fut, E, T> {
+    inner: T,
+    p: PhantomData<(Fut, E)>,
+}
+
+impl<A, Fut, T> FnOnceTrait<A, ErrInto<Fut, RpcError>> for FnOnceErrInto<A, Fut, T>
+where
+    T: FnOnceTrait<A, Fut> + Send,
+    Fut: TryFuture + Send,
+    RpcError: From<Fut::Error>,
+    A: Send,
+{
+    fn call(self, a: A) -> ErrInto<Fut, RpcError> {
+        self.inner.call(a).err_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_function_transform() {
+        let a = || async move { anyhow::Ok(()) };
+        let b = |x: u64| async move { anyhow::Ok(x) };
+        let c = |x: u64, y: u64| async move { anyhow::Ok((x, y)) };
+        let _a = err_into_rpc_error(a);
+        let _b = err_into_rpc_error(b);
+        let _c = err_into_rpc_error(c);
     }
 }

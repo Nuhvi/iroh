@@ -10,7 +10,6 @@
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::io::{BufReader, Read};
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -23,9 +22,7 @@ use std::{collections::HashMap, sync::Arc};
 use abao::encode::SliceExtractor;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::{Bytes, BytesMut};
-use futures::future;
-use futures::{FutureExt, Stream};
-use pin_project::pin_project;
+use futures::{future, Stream};
 use quic_rpc::server::{RpcChannel, RpcServerError};
 use quic_rpc::transport::misc::DummyServerEndpoint;
 use quic_rpc::{RpcServer, ServiceEndpoint};
@@ -46,9 +43,9 @@ use crate::rpc_protocol::{
     ListRequest, ListResponse, ProvideRequest, ProvideResponse, SendmeRequest, SendmeService,
     VersionRequest, VersionResponse, WatchRequest, WatchResponse,
 };
-use crate::rpc_util::RpcChannelExt;
+use crate::rpc_util::{err_into_rpc_error, RpcChannelExt};
 use crate::tls::{self, Keypair, PeerId};
-use crate::util::{self, Hash, RpcError, RpcResult};
+use crate::util::{self, Hash};
 
 const MAX_CONNECTIONS: u32 = 1024;
 const MAX_STREAMS: u64 = 10;
@@ -360,74 +357,6 @@ impl Future for Provider {
     }
 }
 
-trait Invoke<A, R> {
-    fn invoke(self, a: A) -> R;
-}
-impl<R, T: Fn() -> R> Invoke<(), R> for T {
-    fn invoke(self, _: ()) -> R {
-        (self)()
-    }
-}
-impl<A, R, T: Fn(A) -> R> Invoke<(A,), R> for T {
-    fn invoke(self, a: (A,)) -> R {
-        (self)(a.0)
-    }
-}
-impl<A, B, R, T: Fn(A, B) -> R> Invoke<(A, B), R> for T {
-    fn invoke(self, a: (A, B)) -> R {
-        (self)(a.0, a.1)
-    }
-}
-impl<A, B, C, R, T: Fn(A, B, C) -> R> Invoke<(A, B, C), R> for T {
-    fn invoke(self, a: (A, B, C)) -> R {
-        (self)(a.0, a.1, a.2)
-    }
-}
-impl<A, B, C, D, R, T: Fn(A, B, C, D) -> R> Invoke<(A, B, C, D), R> for T {
-    fn invoke(self, a: (A, B, C, D)) -> R {
-        (self)(a.0, a.1, a.2, a.3)
-    }
-}
-
-#[pin_project]
-struct ErrToRpcError<F, R, E>(#[pin] F, PhantomData<(R, E)>);
-
-impl<F, R, E> Future for ErrToRpcError<F, R, E>
-where
-    F: Future<Output = Result<R, E>>,
-    RpcError: From<E>,
-{
-    type Output = RpcResult<R>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        match this.0.poll_unpin(cx) {
-            Poll::Ready(Ok(r)) => Poll::Ready(Ok(r)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(RpcError::from(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-fn transform_result<A, Fut, R, E, T>(value: T) -> impl FnOnce(A) -> ErrToRpcError<Fut, R, E>
-where
-    T: Invoke<A, Fut> + Send + 'static,
-    Fut: Future<Output = Result<R, E>> + Send + 'static,
-    RpcError: From<E>,
-    A: Send + 'static,
-{
-    move |a: A| -> ErrToRpcError<Fut, R, E> { ErrToRpcError(value.invoke(a), PhantomData) }
-}
-
-fn test() {
-    let a = || async move { anyhow::Ok(()) };
-    let b = |x: u64| async move { anyhow::Ok(x) };
-    let c = |x: u64, y: u64| async move { anyhow::Ok((x, y)) };
-    let a = transform_result(a);
-    let b = transform_result(b);
-    let c = transform_result(c);
-}
-
 struct Handler(Database);
 
 impl Handler {
@@ -439,7 +368,7 @@ impl Handler {
             .map(|(hash, path, size)| ListResponse { hash, path, size });
         futures::stream::iter(items)
     }
-    async fn provide_impl(
+    async fn provide(
         self,
         msg: ProvideRequest,
         progress: impl Fn(f64),
@@ -466,15 +395,6 @@ impl Handler {
         let (db, hash) = create_collection_inner(data_sources).await?;
         self.0.union_with(db);
         Ok(ProvideResponse { hash })
-    }
-    async fn provide(
-        self,
-        msg: ProvideRequest,
-        progress: impl Fn(f64),
-    ) -> RpcResult<ProvideResponse> {
-        self.provide_impl(msg, progress)
-            .await
-            .map_err(RpcError::from)
     }
     async fn version(self, _: VersionRequest) -> VersionResponse {
         VersionResponse {
@@ -509,9 +429,11 @@ fn handle_rpc_request<C: ServiceEndpoint<SendmeService>>(
     tokio::spawn(async move {
         let handler = Handler(db.clone());
         use SendmeRequest::*;
+        // transform the provide fn into a closure that can be passed to the rpc_with_progress
+        let provide = err_into_rpc_error(Handler::provide);
         match msg {
             List(msg) => chan.server_streaming(msg, handler, Handler::list).await,
-            Provide(msg) => chan.rpc_with_progress(msg, handler, Handler::provide).await,
+            Provide(msg) => chan.rpc_with_progress(msg, handler, provide).await,
             Watch(msg) => chan.server_streaming(msg, handler, Handler::watch).await,
             Version(msg) => chan.rpc(msg, handler, Handler::version).await,
         }
