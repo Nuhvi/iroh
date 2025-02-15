@@ -3436,13 +3436,13 @@ dependencies = [
 
 [[package]]
 name = "pubky-timestamp"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab61f82c6343aecd77364c3c1c4e9e8288adfb11d2775640395344b8078aa315"
+checksum = "44aafc63c1eab1905e8a8378d2b085500540c9935b6d028908c8a50a5a246a3d"
 dependencies = [
  "base32",
  "document-features",
- "getrandom 0.3.1",
+ "getrandom 0.2.15",
  "httpdate",
  "js-sys",
  "once_cell",
